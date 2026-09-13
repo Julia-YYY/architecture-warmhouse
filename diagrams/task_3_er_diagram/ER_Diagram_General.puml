@@ -1,0 +1,405 @@
+@startuml ER_Diagram_General
+
+' Задание 3 — модель данных экосистемы «Тёплый дом».
+
+title ER-диаграмма — модель данных экосистемы «Тёплый дом», состав MVP
+
+hide circle
+skinparam roundcorner 0
+skinparam shadowing false
+skinparam packageStyle rectangle
+
+' =====================================================================
+' Дома и объекты. Владелец, дома, помещения, права доступа.
+' =====================================================================
+
+package "houses_db — Дома и права доступа (PostgreSQL)" <<Database>> {
+
+    entity "users" as users {
+        * id : uuid <<PK>>
+        --
+        * external_subject_id : text <<UQ>>
+        * email : text
+        display_name : text
+        * created_at : timestamptz
+        ..
+        Локальная проекция учётной записи.
+        Пароли не хранятся: аутентификацию
+        выполняет внешний провайдер,
+        external_subject_id — его sub
+    }
+
+    entity "houses" as houses {
+        * id : uuid <<PK>>
+        --
+        * owner_user_id : uuid <<FK users>>
+        * name : text
+        address : text
+        * timezone : text
+        * created_at : timestamptz
+    }
+
+    entity "rooms" as rooms {
+        * id : uuid <<PK>>
+        --
+        * house_id : uuid <<FK houses>>
+        * name : text
+    }
+
+    entity "house_access" as house_access {
+        * id : uuid <<PK>>
+        --
+        * house_id : uuid <<FK houses>>
+        * user_id : uuid <<FK users>>
+        * role : text <<owner/resident/viewer>>
+        * granted_at : timestamptz
+        granted_by_user_id : uuid <<FK users>>
+        ..
+        UNIQUE (house_id, user_id)
+    }
+}
+
+' =====================================================================
+' Подключение устройств. Реестр: тип, экземпляр, учётные данные.
+' =====================================================================
+
+package "onboarding_db — Реестр устройств (PostgreSQL)" <<Database>> {
+
+    entity "device_types" as device_types {
+        * id : uuid <<PK>>
+        --
+        * code : text <<UQ>>
+        * name : text
+        manufacturer : text
+        * protocol_code : text
+        * is_active : boolean
+        ..
+        Набор возможностей типа хранится
+        здесь же — см. диаграмму кода
+    }
+
+    entity "devices" as devices {
+        * id : uuid <<PK>>
+        --
+        * device_type_id : uuid <<FK device_types>>
+        * house_id : uuid <<логическая ссылка>>
+        room_id : uuid <<логическая ссылка>>
+        * serial_number : text <<UQ>>
+        * executor_code : text <<gateway/legacy>>
+        * lifecycle_status : text <<registered/blocked/decommissioned>>
+        * registered_at : timestamptz
+        ..
+        lifecycle_status — судьба регистрации,
+        а не «включено/выключено»:
+        рабочее состояние живёт в state_db
+    }
+
+    entity "device_credentials" as device_credentials {
+        * device_id : uuid <<PK, FK devices>>
+        --
+        * mqtt_client_id : text <<UQ>>
+        * secret_hash : text
+        * issued_at : timestamptz
+        revoked_at : timestamptz
+    }
+
+    entity "outbox_messages" as outbox {
+        * id : bigint <<PK>>
+        --
+        * aggregate_id : uuid
+        * event_type : text <<DeviceRegistered/...>>
+        * payload : jsonb
+        * created_at : timestamptz
+        published_at : timestamptz
+        ..
+        Событие пишется в одной транзакции
+        с данными и публикуется отдельно.
+        Тот же приём в каждой публикующей службе
+    }
+}
+
+' =====================================================================
+' Управление устройствами. Текущее состояние и журнал команд.
+' =====================================================================
+
+package "state_db — Состояние устройств (PostgreSQL)" <<Database>> {
+
+    entity "device_state" as device_state {
+        * device_id : uuid <<PK, логическая ссылка>>
+        --
+        * connectivity : text <<online/offline/unknown>>
+        last_seen_at : timestamptz
+        * updated_at : timestamptz
+    }
+
+    entity "device_property_state" as property_state {
+        * device_id : uuid <<PK, FK device_state>>
+        * property_name : text <<PK>>
+        --
+        * capability_code : text
+        * value : jsonb
+        * observed_at : timestamptz
+        ..
+        «Включено/выключено» — строка
+        property_name = 'power'.
+        Колонки на каждый тип прибора не заводятся
+    }
+
+    entity "commands" as commands {
+        * id : uuid <<PK>>
+        --
+        * device_id : uuid <<логическая ссылка>>
+        * capability_code : text
+        * command_name : text
+        arguments : jsonb
+        * issued_by_user_id : uuid <<логическая ссылка>>
+        issued_by_scenario_id : uuid <<логическая ссылка>>
+        * status : text <<sent/completed/failed>>
+        * created_at : timestamptz
+        completed_at : timestamptz
+        error : text
+        ..
+        Промежуточное состояние sent обязательно:
+        иначе повторное нажатие не отличить от первого
+    }
+}
+
+' =====================================================================
+' Телеметрия. Ряды наблюдений во времени.
+' =====================================================================
+
+package "telemetry_db — Хранилище телеметрии (TimescaleDB)" <<Database>> {
+
+    entity "observations" as observations {
+        * observed_at : timestamptz <<PK>>
+        * device_id : uuid <<PK, логическая ссылка>>
+        * property_name : text <<PK>>
+        --
+        * capability_code : text
+        value_num : double precision
+        value_text : text
+        ..
+        Гипертаблица с разбиением по времени.
+        Внешних ключей нет намеренно: запись
+        преобладает над чтением
+    }
+
+    entity "observations_hourly" as observations_agg {
+        * bucket : timestamptz <<PK>>
+        * device_id : uuid <<PK>>
+        * property_name : text <<PK>>
+        --
+        avg_value : double precision
+        min_value : double precision
+        max_value : double precision
+        ..
+        Непрерывная агрегация: графики за месяц
+        не читают сырой ряд
+    }
+}
+
+' =====================================================================
+' Сценарии автоматизации.
+' =====================================================================
+
+package "automation_db — Правила сценариев (PostgreSQL)" <<Database>> {
+
+    entity "scenarios" as scenarios {
+        * id : uuid <<PK>>
+        --
+        * house_id : uuid <<логическая ссылка>>
+        * owner_user_id : uuid <<логическая ссылка>>
+        * name : text
+        * is_enabled : boolean
+        * created_at : timestamptz
+    }
+
+    entity "scenario_conditions" as conditions {
+        * id : uuid <<PK>>
+        --
+        * scenario_id : uuid <<FK scenarios>>
+        * device_id : uuid <<логическая ссылка>>
+        * capability_code : text
+        * property_name : text
+        * operator : text <<lt/lte/eq/gte/gt>>
+        * threshold : jsonb
+        * group_operator : text <<and/or>>
+    }
+
+    entity "scenario_actions" as actions {
+        * id : uuid <<PK>>
+        --
+        * scenario_id : uuid <<FK scenarios>>
+        * order_no : int
+        * device_id : uuid <<логическая ссылка>>
+        * capability_code : text
+        * command_name : text
+        arguments : jsonb
+    }
+
+    entity "scenario_schedules" as schedules {
+        * id : uuid <<PK>>
+        --
+        * scenario_id : uuid <<FK scenarios>>
+        * cron_expression : text
+        * timezone : text
+    }
+
+    entity "scenario_runs" as runs {
+        * id : uuid <<PK>>
+        --
+        * scenario_id : uuid <<FK scenarios>>
+        * triggered_at : timestamptz
+        * trigger_source : text <<observation/schedule/manual>>
+        * result : text <<completed/partially_failed/failed>>
+    }
+}
+
+' =====================================================================
+' As-Is. Действующая схема монолита, выводимая из эксплуатации.
+' =====================================================================
+
+package "monolith_db — БД монолита, As-Is (PostgreSQL)" <<Database>> {
+
+    entity "sensors" as sensors {
+        * id : serial <<PK>>
+        --
+        * name : text
+        * type : text <<единственное значение 'temperature'>>
+        * location : text
+        value : double precision
+        unit : text
+        status : text
+        last_updated : timestamptz
+        * created_at : timestamptz
+        ..
+        Описание типа, экземпляр прибора
+        и последнее показание — в одной строке.
+        Ни дома, ни пользователя нет:
+        привязка к владельцу отсутствует
+    }
+}
+
+' =====================================================================
+' Связи внутри одного хранилища — настоящие внешние ключи
+' =====================================================================
+
+users ||--o{ houses : владеет
+houses ||--o{ rooms : содержит
+houses ||--o{ house_access : открывает доступ
+users ||--o{ house_access : получает доступ
+
+device_types ||--o{ devices : экземпляры типа
+devices ||--|| device_credentials : учётные данные
+
+device_state ||--o{ property_state : значения свойств
+
+scenarios ||--o{ conditions : условия
+scenarios ||--o{ actions : действия
+scenarios ||--o{ schedules : расписания
+scenarios ||--o{ runs : срабатывания
+
+' =====================================================================
+' Связи между хранилищами — логические, внешнего ключа нет.
+' Целостность обеспечивается службой-владельцем данных и событиями.
+' =====================================================================
+
+houses ||..o{ devices : дом устройства
+rooms ||..o{ devices : размещение
+devices ||..|| device_state : текущее состояние
+devices ||..o{ commands : команды устройству
+devices ||..o{ observations : наблюдения
+observations }o..|| observations_agg : агрегируется
+houses ||..o{ scenarios : сценарии дома
+devices ||..o{ conditions : условие по устройству
+devices ||..o{ actions : действие над устройством
+scenarios ||..o{ commands : команда от сценария
+sensors }o..|| devices : переносится\nслоем предотвращения искажений
+
+' =====================================================================
+' Пояснения
+' =====================================================================
+
+note as N_notation
+  **Обозначения**
+  ....
+  Вороньи лапки: || — ровно один, |o — ноль или один,
+  o{ — ноль или много.
+  ....
+  **Сплошная линия** — внешний ключ. Возможен только внутри
+  одного хранилища.
+  ....
+  **Пунктирная линия** — логическая ссылка между хранилищами
+  разных служб. Внешнего ключа нет и быть не может: базы
+  раздельные. Целостность обеспечивает служба-владелец,
+  а согласованность — события шины.
+end note
+
+note as N_split
+  **Почему модель разбита по хранилищам**
+  ....
+  Ни одна служба не читает хранилище другой.
+  ....
+  Цена решения принята сознательно: часть проверок, которые
+  в одной базе выполнял бы внешний ключ, переносится в код
+  службы-владельца. Например, принадлежность дома проверяет
+  «Подключение устройств» синхронным вызовом «Домов и объектов»
+  при регистрации.
+  ....
+  Идентификаторы — uuid: значение должно быть
+  осмысленным в нескольких базах сразу и не зависеть
+  от последовательности в одной из них.
+end note
+
+note as N_state
+  **Три разных «состояния» намеренно разведены**
+  ....
+  **devices.lifecycle_status** — зарегистрировано, заблокировано,
+  снято с учёта. Меняется редко, принадлежит реестру.
+  ....
+  **device_property_state.value** — включено или выключено,
+  текущая температура, положение ворот. Меняется постоянно.
+  ....
+  **observations** — история тех же величин. Пишется много,
+  читается редко, живёт в другой СУБД.
+end note
+
+note as N_capability
+  **Чего здесь нет намеренно**
+  ....
+  **Каталог возможностей** — capability_definitions,
+  property_definitions, command_definitions, type_capabilities.
+  Живёт в onboarding_db, разобран на диаграмме кода. Опущен,
+  чтобы экосистема была видна целиком.
+  ....
+  **Хранилище уведомлений** — служба «Уведомления» на диаграмме
+  контейнеров показана без базы: в прослеженных сценариях ТЗ
+  шаблоны и настройки доставки не изменяются.
+  ....
+  **Хранилища фазы 2** — catalog_db (комплекты и заказы)
+  и billing_db (подписки и платежи). Вынесены в отдельный файл
+  ER_Diagram_Phase2.puml.
+  ....
+  **Видеонаблюдение** напрямую не указано ни в одном сценарии ТЗ.
+  Поток камеры в модели возможностей описывается свойством
+  типа StreamUri и записи в наблюдениях не порождает.
+end note
+
+note as N_legacy
+  **Переход от sensors к целевой модели**
+  ....
+  Одна строка sensors распадается на четыре записи:
+  device_types (тип), devices (экземпляр),
+  device_property_state (последнее показание),
+  observations (история).
+  ....
+  Дом и владелец в sensors отсутствуют — location задан строкой.
+  На время MVP унаследованные приборы привязываются к дому
+  вручную при переносе; это плата за отсутствие связи
+  в действующей схеме.
+  ....
+  Перенос выполняет слой предотвращения искажений —
+  единственный код, которому схема sensors известна.
+end note
+
+@enduml

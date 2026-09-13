@@ -1,0 +1,1794 @@
+openapi: 3.2.0
+
+# =====================================================================
+# Задание 4 — контракты микросервисов «Тёплый дом».
+#
+# 5 операций двух служб целевой архитектуры:
+#   «Управление устройствами» — 3 операции,
+#   «Шлюз устройств»          — 2 операции.
+# =====================================================================
+
+info:
+  title: «Тёплый дом» — внутренние API управления устройствами
+  version: 1.0.0
+  description: |-
+    Контракты взаимодействия двух микросервисов целевой экосистемы «Тёплый дом».
+
+    ## Какие службы описаны
+
+    | Служба | Роль на диаграмме компонентов | Кто вызывает |
+    |---|---|---|
+    | Управление устройствами | Приём и маршрутизация команд, текущее состояние устройств | API Gateway, Сценарии автоматизации |
+    | Шлюз устройств | Перевод модели возможностей в протокол устройства и обратно | Управление устройствами, Подключение устройств |
+
+    ## Синхронное и асинхронное взаимодействие
+
+    Разделение повторяет подписи рёбер на `diagrams/component/WarmHouse_Component.puml`.
+
+    **Синхронны четыре операции чтения** (`sync, JSON/HTTPS` на диаграмме):
+    `getDeviceStatus`, `getCapabilities`, `getDeviceTypesByProtocol`, `addProtocol`.
+    Вызывающей стороне нужен немедленный ответ, состояние читается из хранилища
+    вызываемой службы.
+
+    **Асинхронна по существу одна операция — `sendCommandToDevice`.**
+    Устройство физически не может ответить в рамках HTTP-запроса: команда уходит
+    в MQTT-топик, результат приходит обратно событием шины
+    (`DeviceCommandCompleted` / `DeviceCommandFailed`). Поэтому применён шаблон
+    **async request-reply**:
+
+    1. `POST /device_management/sendCommandToDevice` отвечает `202 Accepted`
+       и возвращает `commandId`. В журнале команд появляется запись со
+       статусом `sent`.
+    2. Результат доставляется одним из двух способов:
+       * **push** — вызовом обратного адреса `callbackUrl`, если он передан
+         в запросе (блок `callbacks` ниже);
+       * **pull** — опросом `GET /device_management/getDeviceStatus`,
+         в ответе которого команда видна в `pendingCommands` до завершения.
+
+    Промежуточный статус `sent` обязателен: без него повторное нажатие кнопки
+    неотличимо от первого. По той же причине команда принимает заголовок
+    `Idempotency-Key`.
+
+    ## Модель возможностей
+
+    Ни один контракт не перечисляет конкретные типы устройств. Команда адресуется
+    парой «код возможности + имя команды» (`capabilityCode` + `commandName`),
+    состояние возвращается парами «имя свойства → значение».
+    Появление нового типа устройства есть новая строка в реестре, а не правка этой
+    спецификации. Тип устройства — это
+    данные, не код.
+
+  contact:
+    name: Команда платформы «Тёплый дом»
+    email: platform@warmhouse.example
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+externalDocs:
+  description: Диаграмма компонентов, из которой выведены контракты
+  url: https://github.com/warmhouse/architecture-s1-project/blob/warmhouse/diagrams/component/WarmHouse_Component.puml
+
+servers:
+  - url: https://api.warmhouse.example/internal
+    description: Промышленный контур, внутренняя сеть
+  - url: https://api.stage.warmhouse.example/internal
+    description: Тестовый контур
+  - url: http://localhost:8080/internal
+    description: Локальная разработка
+
+tags:
+  - name: device_management
+    summary: Управление устройствами
+    description: |-
+      Отдаёт текущее состояние устройств, принимает и маршрутизирует команды.
+      Решает, допустима ли команда (права на дом + возможности типа) и кто её
+      исполнит — шлюз устройств или слой предотвращения искажений к монолиту.
+  - name: device_gateway
+    summary: Шлюз устройств
+    description: |-
+      Переводит модель возможностей в команды конкретного протокола и обратно.
+      Знает реестр протокольных адаптеров; профиль возможностей и протокол
+      каждого устройства получает событием `DeviceRegistered`.
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  # ===================================================================
+  # Управление устройствами
+  # ===================================================================
+
+  /device_management/sendCommandToDevice:
+    post:
+      tags:
+        - device_management
+      summary: Отправить команду устройству в доме
+      operationId: sendCommandToDevice
+      description: |-
+        Принимает команду в модели возможностей и ставит её на исполнение.
+
+        **Операция асинхронная.** Ответ `202 Accepted` означает только то, что
+        команда прошла проверку прав и возможностей и передана исполнителю.
+        Фактическое исполнение устройством подтверждается позже — вызовом
+        `callbackUrl` или изменением состояния, видимым в `getDeviceStatus`.
+
+        Служба последовательно выполняет:
+
+        1. проверку прав вызывающего пользователя на дом устройства
+           (синхронное чтение службы «Дома и объекты») → `403`;
+        2. чтение записи реестра: возможности типа и код исполнителя
+           (синхронное чтение службы «Подключение устройств») → `404`;
+        3. сверку команды с возможностями типа → `422`;
+        4. запись в журнал команд со статусом `sent`;
+        5. выбор исполнителя по `executorCode`: шлюз устройств для
+           устройств, подключённых напрямую, либо слой предотвращения
+           искажений для унаследованных модулей отопления.
+
+        Недоступность исполнителя после шага 4 **не** приводит к ошибке HTTP:
+        команда уже принята, а отказ доставляется событием
+        `DeviceCommandFailed` с `errorCode = executor_unavailable`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        description: Команда в модели возможностей
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceCommandRequest'
+            examples:
+              turnOnLight:
+                summary: Включить свет — возможность switchable
+                description: |-
+                  Простейшая команда без аргументов. Приходит от API Gateway
+                  после нажатия кнопки в мобильном приложении.
+                value:
+                  deviceId: b1d4e8a2-9c3f-4b7e-8d51-2a6f0c9e7b34
+                  capabilityCode: switchable
+                  commandName: turn_on
+                  callbackUrl: https://api.warmhouse.example/internal/hooks/command-result
+              setBoilerTarget:
+                summary: Задать целевую температуру котла — возможность thermostat
+                description: |-
+                  Команда с аргументом. Допустимый диапазон аргумента задан
+                  не здесь, а спецификацией значения в реестре типов
+                  (у одного котла 5..35 °C, у другого 5..95 °C).
+                value:
+                  deviceId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                  capabilityCode: thermostat
+                  commandName: set_target
+                  arguments:
+                    target_temperature: 22.5
+                  callbackUrl: https://api.warmhouse.example/internal/hooks/command-result
+              openGateFromScenario:
+                summary: Открыть ворота наполовину — команда от сценария
+                description: |-
+                  Тот же контракт используется службой «Сценарии автоматизации»:
+                  действие сработавшего сценария приходит как обычная команда.
+                  Отличие только в `issuedByScenarioId`. Обратный адрес не задан —
+                  сценарию результат доставляется событием шины.
+                value:
+                  deviceId: 3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f601
+                  capabilityCode: positionable
+                  commandName: open_to
+                  arguments:
+                    position: 50
+                  issuedByScenarioId: c8f0e2d1-4a5b-4c6d-9e7f-081a2b3c4d5e
+              legacyBoiler:
+                summary: Команда унаследованному модулю отопления
+                description: |-
+                  Клиент не знает, что устройство обслуживается монолитом:
+                  выбор исполнителя происходит внутри по данным реестра.
+                  Контракт для обоих путей один.
+                value:
+                  deviceId: 5e2b8c7d-1f34-4a90-b6c8-7d9e0f1a2b3c
+                  capabilityCode: switchable
+                  commandName: turn_off
+      responses:
+        '202':
+          description: |-
+            Команда принята к исполнению. Результат будет доставлен отдельно.
+          headers:
+            Location:
+              description: Адрес для опроса состояния устройства и этой команды
+              schema:
+                type: string
+                format: uri
+            Idempotency-Replayed:
+              description: |-
+                `true`, если запрос распознан как повтор по `Idempotency-Key`
+                и новая команда не создавалась.
+              schema:
+                type: boolean
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandAccepted'
+              examples:
+                accepted:
+                  summary: Команда поставлена в исполнение
+                  value:
+                    commandId: 9a1c2f30-8b44-4d1e-9f2a-5c6d7e8f9012
+                    deviceId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                    status: sent
+                    executorCode: gateway
+                    acceptedAt: '2026-09-13T18:20:11Z'
+                    statusUrl: https://api.warmhouse.example/internal/device_management/getDeviceStatus?deviceId=7c9e6679-7425-40de-944b-e07fc1f90ae7
+                replayed:
+                  summary: Повторный запрос с тем же Idempotency-Key
+                  description: |-
+                    Возвращается та же команда, что и в первый раз.
+                    Второй раз устройству ничего не отправляется.
+                  value:
+                    commandId: 9a1c2f30-8b44-4d1e-9f2a-5c6d7e8f9012
+                    deviceId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                    status: sent
+                    executorCode: gateway
+                    acceptedAt: '2026-09-13T18:20:11Z'
+                    statusUrl: https://api.warmhouse.example/internal/device_management/getDeviceStatus?deviceId=7c9e6679-7425-40de-944b-e07fc1f90ae7
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/DeviceNotFound'
+        '409':
+          description: |-
+            Устройство есть в реестре, но команды не принимает: запись
+            заблокирована или снята с учёта.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                blocked:
+                  summary: Устройство заблокировано
+                  value:
+                    code: device_not_operable
+                    message: Устройство заблокировано и не принимает команды
+                    details:
+                      deviceId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                      lifecycleStatus: blocked
+                    traceId: 0af7651916cd43dd8448eb211c80319c
+        '422':
+          description: |-
+            Команда не соответствует возможностям типа устройства: возможность
+            не поддерживается, команда неизвестна, аргумент вне допустимого
+            диапазона или не того типа.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                capabilityNotSupported:
+                  summary: Тип устройства не обладает такой возможностью
+                  value:
+                    code: capability_not_supported
+                    message: Тип устройства не поддерживает возможность positionable
+                    details:
+                      deviceTypeCode: boiler_v2
+                      capabilityCode: positionable
+                      supportedCapabilities:
+                        - switchable
+                        - thermostat
+                        - measurable
+                    traceId: 0af7651916cd43dd8448eb211c80319c
+                argumentOutOfRange:
+                  summary: Аргумент вне диапазона, заданного реестром
+                  value:
+                    code: argument_out_of_range
+                    message: Аргумент target_temperature вне допустимого диапазона
+                    details:
+                      parameter: target_temperature
+                      value: 120
+                      min: 5
+                      max: 35
+                      unit: °C
+                    traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+      callbacks:
+        commandResult:
+          '{$request.body#/callbackUrl}':
+            post:
+              summary: Результат исполнения команды устройством
+              operationId: onDeviceCommandResult
+              description: |-
+                Вызывается службой «Управление устройствами» после того, как
+                результат команды получен событием шины
+                (`DeviceCommandCompleted` или `DeviceCommandFailed`).
+
+                Вызов выполняется, только если в исходном запросе был передан
+                `callbackUrl`. Гарантия доставки — «не менее одного раза»:
+                получатель обязан распознавать повтор по `commandId`.
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      oneOf:
+                        - $ref: '#/components/schemas/DeviceCommandCompleted'
+                        - $ref: '#/components/schemas/DeviceCommandFailed'
+                      discriminator:
+                        propertyName: status
+                        mapping:
+                          completed: '#/components/schemas/DeviceCommandCompleted'
+                          failed: '#/components/schemas/DeviceCommandFailed'
+                    examples:
+                      completed:
+                        summary: Команда исполнена
+                        description: |-
+                          Наблюдаемые свойства, изменившиеся в результате команды,
+                          передаются вместе с результатом — чтобы вызывающей
+                          стороне не пришлось делать дополнительное чтение.
+                        value:
+                          commandId: 9a1c2f30-8b44-4d1e-9f2a-5c6d7e8f9012
+                          deviceId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                          status: completed
+                          completedAt: '2026-09-13T18:20:13Z'
+                          observedProperties:
+                            - capabilityCode: thermostat
+                              propertyName: target_temperature
+                              value: 22.5
+                              observedAt: '2026-09-13T18:20:13Z'
+                            - capabilityCode: switchable
+                              propertyName: power
+                              value: true
+                              observedAt: '2026-09-13T18:20:13Z'
+                      failedTimeout:
+                        summary: Устройство не подтвердило исполнение
+                        value:
+                          commandId: 9a1c2f30-8b44-4d1e-9f2a-5c6d7e8f9012
+                          deviceId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                          status: failed
+                          failedAt: '2026-09-13T18:20:41Z'
+                          errorCode: device_timeout
+                          error: Устройство не подтвердило исполнение за 30 с
+                      failedExecutor:
+                        summary: Исполнитель недоступен
+                        description: |-
+                          Отказ, который невозможно вернуть кодом HTTP: на момент
+                          ответа 202 команда уже была принята.
+                        value:
+                          commandId: 1b2c3d4e-5f60-4718-9a2b-3c4d5e6f7081
+                          deviceId: 5e2b8c7d-1f34-4a90-b6c8-7d9e0f1a2b3c
+                          status: failed
+                          failedAt: '2026-09-13T18:21:02Z'
+                          errorCode: executor_unavailable
+                          error: Слой предотвращения искажений к монолиту недоступен
+              responses:
+                '200':
+                  description: Результат принят получателем
+                '410':
+                  description: |-
+                    Обратный адрес больше не обслуживается. Повторные попытки
+                    доставки прекращаются.
+
+  /device_management/getDeviceStatus:
+    get:
+      tags:
+        - device_management
+      summary: Получить текущее состояние устройства
+      operationId: getDeviceStatus
+      description: |-
+        Возвращает последнее известное состояние устройства: связь с сетью,
+        значения наблюдаемых свойств и команды, по которым ещё не получен
+        результат.
+
+        **Операция синхронная.** Читается только собственное хранилище службы,
+        обращения к устройству не происходит — поэтому `observedAt` каждого
+        свойства может отличаться от текущего времени. Если устройство
+        недоступно, операция всё равно отвечает `200`, а признак
+        `connectivity` принимает значение `offline`.
+
+        Опрос этой операции — второй способ узнать результат команды, если
+        обратный адрес не передавался: пока команда не завершена, она видна
+        в `pendingCommands`.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdQuery'
+        - name: includePendingCommands
+          in: query
+          required: false
+          description: Возвращать ли незавершённые команды устройства
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Текущее состояние устройства
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceState'
+              examples:
+                boilerOnline:
+                  summary: Котёл на связи, есть незавершённая команда
+                  value:
+                    deviceId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                    deviceTypeCode: boiler_v2
+                    houseId: 2a7f4e10-9b3c-4d58-8e61-0f2a3b4c5d6e
+                    roomId: 6d5c4b3a-2918-4e07-b6a5-948372615043
+                    connectivity: online
+                    lastSeenAt: '2026-09-13T18:20:09Z'
+                    updatedAt: '2026-09-13T18:20:09Z'
+                    properties:
+                      - capabilityCode: switchable
+                        propertyName: power
+                        value: true
+                        observedAt: '2026-09-13T18:20:09Z'
+                      - capabilityCode: thermostat
+                        propertyName: target_temperature
+                        value: 21
+                        unit: °C
+                        observedAt: '2026-09-13T18:18:00Z'
+                      - capabilityCode: measurable
+                        propertyName: temperature
+                        value: 20.4
+                        unit: °C
+                        observedAt: '2026-09-13T18:20:09Z'
+                    pendingCommands:
+                      - commandId: 9a1c2f30-8b44-4d1e-9f2a-5c6d7e8f9012
+                        capabilityCode: thermostat
+                        commandName: set_target
+                        status: sent
+                        createdAt: '2026-09-13T18:20:11Z'
+                gateOffline:
+                  summary: Ворота вне связи — отдаётся последнее известное состояние
+                  description: |-
+                    Признак `connectivity: offline` и давний `observedAt` —
+                    честный ответ службы: значения не выдуманы, а просто устарели.
+                  value:
+                    deviceId: 3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f601
+                    deviceTypeCode: gate_v1
+                    houseId: 2a7f4e10-9b3c-4d58-8e61-0f2a3b4c5d6e
+                    connectivity: offline
+                    lastSeenAt: '2026-09-13T11:02:47Z'
+                    updatedAt: '2026-09-13T11:02:47Z'
+                    properties:
+                      - capabilityCode: positionable
+                        propertyName: position
+                        value: 0
+                        unit: '%'
+                        observedAt: '2026-09-13T11:02:47Z'
+                    pendingCommands: []
+                neverSeen:
+                  summary: Устройство зарегистрировано, но ни разу не выходило на связь
+                  value:
+                    deviceId: e4f5a6b7-c8d9-4012-8345-6789abcdef01
+                    deviceTypeCode: partner_thermometer_v3
+                    houseId: 2a7f4e10-9b3c-4d58-8e61-0f2a3b4c5d6e
+                    connectivity: unknown
+                    updatedAt: '2026-09-13T09:00:00Z'
+                    properties: []
+                    pendingCommands: []
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/DeviceNotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /device_management/getCapabilities:
+    get:
+      tags:
+        - device_management
+      summary: Получить возможности устройства или типа устройств
+      operationId: getCapabilities
+      description: |-
+        Возвращает профиль возможностей: какие свойства у устройства можно
+        наблюдать и какие команды ему можно отдавать, с допустимыми единицами,
+        диапазонами и перечислениями значений.
+
+        **Операция синхронная.** Профиль читается из реестра службы
+        «Подключение устройств» и отдаётся в неизменном виде.
+
+        Назначение — избавить клиента от знания конкретных типов устройств.
+        Интерфейс строится по ответу этой операции: команда `set_target`
+        с числовым параметром 5..35 °C превращается в ползунок, команда
+        `turn_on` — в переключатель. Появление нового типа устройства меняет
+        ответ, но не код клиента.
+
+        Указывается **ровно один** из параметров: `deviceId` для конкретного
+        экземпляра либо `deviceTypeCode` для типа. Если переданы оба или ни
+        одного, возвращается `400`.
+      parameters:
+        - name: deviceId
+          in: query
+          required: false
+          description: Идентификатор экземпляра устройства
+          schema:
+            type: string
+            format: uuid
+          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        - name: deviceTypeCode
+          in: query
+          required: false
+          description: Код типа устройства в реестре
+          schema:
+            type: string
+          example: gate_v1
+      responses:
+        '200':
+          description: Профиль возможностей
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityProfile'
+              examples:
+                boilerByDevice:
+                  summary: Возможности котла, запрошенные по устройству
+                  description: |-
+                    Диапазон 5..35 °C — уточнение возможности для этого типа.
+                    У другой модели котла та же возможность `thermostat` может
+                    иметь диапазон 5..95 °C, и это данные реестра, а не код.
+                  value:
+                    deviceId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                    deviceTypeCode: boiler_v2
+                    deviceTypeName: Котёл «Тёплый дом» второго поколения
+                    protocolCode: native_warmhouse_v1
+                    executorCode: gateway
+                    capabilities:
+                      - code: switchable
+                        name: Включение и выключение
+                        properties:
+                          - name: power
+                            spec:
+                              dataType: boolean
+                        commands:
+                          - name: turn_on
+                            parameters: []
+                          - name: turn_off
+                            parameters: []
+                      - code: thermostat
+                        name: Поддержание температуры
+                        properties:
+                          - name: target_temperature
+                            spec:
+                              dataType: number
+                              unit: °C
+                              min: 5
+                              max: 35
+                        commands:
+                          - name: set_target
+                            parameters:
+                              - name: target_temperature
+                                required: true
+                                spec:
+                                  dataType: number
+                                  unit: °C
+                                  min: 5
+                                  max: 35
+                      - code: measurable
+                        name: Измерение величины
+                        properties:
+                          - name: temperature
+                            spec:
+                              dataType: number
+                              unit: °C
+                              min: -50
+                              max: 125
+                        commands: []
+                gateByType:
+                  summary: Возможности ворот, запрошенные по типу
+                  description: |-
+                    Проверка сценария 6 технического задания: возможность
+                    `positionable` добавлена в каталог данными, ни одна операция
+                    этой спецификации при этом не изменилась.
+                  value:
+                    deviceTypeCode: gate_v1
+                    deviceTypeName: Привод откатных ворот
+                    protocolCode: native_warmhouse_v1
+                    executorCode: gateway
+                    capabilities:
+                      - code: switchable
+                        name: Включение и выключение
+                        properties:
+                          - name: power
+                            spec:
+                              dataType: boolean
+                        commands:
+                          - name: turn_on
+                            parameters: []
+                          - name: turn_off
+                            parameters: []
+                      - code: positionable
+                        name: Положение привода
+                        properties:
+                          - name: position
+                            spec:
+                              dataType: number
+                              unit: '%'
+                              min: 0
+                              max: 100
+                        commands:
+                          - name: open_to
+                            parameters:
+                              - name: position
+                                required: true
+                                spec:
+                                  dataType: number
+                                  unit: '%'
+                                  min: 0
+                                  max: 100
+                camera:
+                  summary: Камера — возможность без единиц измерения
+                  description: |-
+                    Тип значения `stream_uri` показывает, что модель возможностей
+                    не ограничена числами: поток камеры описывается свойством
+                    и записи в телеметрии не порождает.
+                  value:
+                    deviceTypeCode: partner_camera_v1
+                    deviceTypeName: Камера наблюдения партнёра
+                    protocolCode: onvif_profile_s
+                    executorCode: gateway
+                    capabilities:
+                      - code: streamable
+                        name: Видеопоток
+                        properties:
+                          - name: stream_uri
+                            spec:
+                              dataType: stream_uri
+                        commands:
+                          - name: snapshot
+                            parameters: []
+        '400':
+          description: |-
+            Не передан ни один идентифицирующий параметр либо переданы оба сразу.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                noSelector:
+                  summary: Не указано, что именно запрошено
+                  value:
+                    code: invalid_request
+                    message: Укажите ровно один из параметров deviceId или deviceTypeCode
+                    traceId: 8c4e1f0a2b3d4e5f6071829384a5b6c7
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Устройство или тип устройства в реестре не найдены
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                typeNotFound:
+                  summary: Неизвестный код типа
+                  value:
+                    code: device_type_not_found
+                    message: Тип устройства gate_v9 в реестре не зарегистрирован
+                    details:
+                      deviceTypeCode: gate_v9
+                    traceId: 8c4e1f0a2b3d4e5f6071829384a5b6c7
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  # ===================================================================
+  # Шлюз устройств
+  # ===================================================================
+
+  /device_gateway/typesByProtocol:
+    get:
+      tags:
+        - device_gateway
+      summary: Выбрать типы устройств, поддерживающие заданный протокол
+      operationId: getDeviceTypesByProtocol
+      description: |-
+        Возвращает типы устройств, для которых шлюз имеет работающий адаптер
+        указанного протокола.
+
+        **Операция синхронная.** Читается проекция реестра, которую шлюз ведёт
+        у себя: синхронный вызов чужой службы на каждое сообщение устройства
+        недопустим, поэтому проекция обновляется событием `DeviceRegistered`.
+
+        Основное применение — подбор комплекта: клиент указывает протокол,
+        который уже используется в доме, и получает перечень типов, которые
+        к этому дому подойдут.
+
+        Ответ отражает состояние проекции, а не реестра в момент запроса.
+        Отставание проекции на несколько секунд после регистрации нового
+        типа — ожидаемое поведение, а не ошибка.
+      parameters:
+        - name: protocolCode
+          in: query
+          required: true
+          description: Код протокола, зарегистрированного в шлюзе
+          schema:
+            type: string
+          example: zigbee_3_0
+        - name: capabilityCode
+          in: query
+          required: false
+          description: |-
+            Оставить только типы, обладающие указанной возможностью.
+            Позволяет спросить «что из поддерживаемого умеет открывать ворота».
+          schema:
+            type: string
+          example: positionable
+        - name: onlyActive
+          in: query
+          required: false
+          description: Исключить типы, снятые с продажи
+          schema:
+            type: boolean
+            default: true
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Типы устройств, поддерживающие протокол
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceTypeList'
+              examples:
+                zigbeeTypes:
+                  summary: Типы для протокола партнёров
+                  value:
+                    protocolCode: zigbee_3_0
+                    items:
+                      - code: partner_lamp_v3
+                        name: Умная лампа партнёра
+                        manufacturer: Partner Devices
+                        protocolCode: zigbee_3_0
+                        isActive: true
+                        capabilityCodes:
+                          - switchable
+                          - dimmable
+                      - code: partner_thermometer_v3
+                        name: Термометр партнёра
+                        manufacturer: Partner Devices
+                        protocolCode: zigbee_3_0
+                        isActive: true
+                        capabilityCodes:
+                          - measurable
+                    pagination:
+                      page: 1
+                      pageSize: 20
+                      totalPages: 1
+                      totalResults: 2
+                emptyResult:
+                  summary: Протокол известен, подходящих типов нет
+                  description: |-
+                    Пустой список — это `200`, а не `404`: протокол существует,
+                    просто под фильтр ничего не попало.
+                  value:
+                    protocolCode: modbus_tcp
+                    items: []
+                    pagination:
+                      page: 1
+                      pageSize: 20
+                      totalPages: 0
+                      totalResults: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Протокол в шлюзе не зарегистрирован
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                unknownProtocol:
+                  summary: Неизвестный код протокола
+                  value:
+                    code: protocol_not_found
+                    message: Протокол knx_ip в шлюзе не зарегистрирован
+                    details:
+                      protocolCode: knx_ip
+                      knownProtocols:
+                        - native_warmhouse_v1
+                        - zigbee_3_0
+                        - modbus_tcp
+                        - onvif_profile_s
+                    traceId: f1e2d3c4b5a60718293a4b5c6d7e8f90
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /device_gateway/protocols:
+    post:
+      tags:
+        - device_gateway
+      summary: Зарегистрировать новый отраслевой протокол
+      operationId: addProtocol
+      description: |-
+        Заводит в шлюзе запись о новом протоколе и связывает её с протокольным
+        адаптером.
+
+        **Операция синхронная.** Ответ `201` означает, что запись создана
+        и реестр адаптеров перечитан.
+
+        **Честная граница возможностей.** Регистрация записи не добавляет
+        поддержку протокола сама по себе: адаптер — это код, реализующий
+        кодирование команды и разбор сообщения. Операция проверяет, развёрнут
+        ли адаптер с указанным `adapterCode`, и возвращает `adapterStatus`:
+
+        * `available` — адаптер найден, протокол готов к работе;
+        * `missing` — запись создана, но адаптер не развёрнут. Устройства
+          этого протокола будут приниматься реестром и отвергаться шлюзом
+          до выкладки адаптера.
+
+        Это единственная точка, которую затрагивает появление нового протокола.
+        Реестр адаптеров, преобразователь модели возможностей, издатель и
+        подписчик брокера не меняются.
+
+        Операция административная: доступна только по служебному ключу,
+        пользовательский токен для неё не принимается.
+      security:
+        - serviceAuth: []
+      requestBody:
+        required: true
+        description: Описание регистрируемого протокола
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProtocolCreate'
+            examples:
+              matter:
+                summary: Протокол партнёров поверх MQTT
+                value:
+                  code: matter_1_2
+                  name: Matter 1.2
+                  transport: mqtt
+                  adapterCode: matter-adapter
+                  description: Стандартный отраслевой протокол умного дома
+              modbus:
+                summary: Промышленный протокол поверх TCP
+                description: |-
+                  Адаптер ещё не развёрнут — запись создаётся заранее, чтобы
+                  служба подключения устройств могла принимать заявки.
+                value:
+                  code: modbus_tcp
+                  name: Modbus TCP
+                  transport: tcp
+                  adapterCode: modbus-adapter
+      responses:
+        '201':
+          description: Протокол зарегистрирован
+          headers:
+            Location:
+              description: Адрес созданной записи протокола
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Protocol'
+              examples:
+                created:
+                  summary: Адаптер развёрнут, протокол готов к работе
+                  value:
+                    code: matter_1_2
+                    name: Matter 1.2
+                    transport: mqtt
+                    adapterCode: matter-adapter
+                    adapterStatus: available
+                    description: Стандартный отраслевой протокол умного дома
+                    registeredAt: '2026-09-13T18:30:00Z'
+                createdWithoutAdapter:
+                  summary: Запись создана, адаптер не развёрнут
+                  description: |-
+                    Ответ успешный, но `adapterStatus: missing` прямо сообщает,
+                    что работать протокол пока не будет.
+                  value:
+                    code: modbus_tcp
+                    name: Modbus TCP
+                    transport: tcp
+                    adapterCode: modbus-adapter
+                    adapterStatus: missing
+                    registeredAt: '2026-09-13T18:31:12Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |-
+            Передан пользовательский токен вместо служебного ключа либо
+            у вызывающей стороны нет права администрирования платформы.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                forbidden:
+                  summary: Операция недоступна пользователю
+                  value:
+                    code: forbidden
+                    message: Регистрация протокола доступна только службам платформы
+                    traceId: 7a8b9c0d1e2f30415263748596a7b8c9
+        '409':
+          description: Протокол с таким кодом уже зарегистрирован
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                duplicate:
+                  summary: Повторная регистрация
+                  value:
+                    code: protocol_already_exists
+                    message: Протокол zigbee_3_0 уже зарегистрирован
+                    details:
+                      protocolCode: zigbee_3_0
+                      registeredAt: '2026-04-02T10:15:00Z'
+                    traceId: 7a8b9c0d1e2f30415263748596a7b8c9
+        '422':
+          description: |-
+            Описание протокола не прошло проверку: код не соответствует формату
+            либо указан неподдерживаемый транспорт.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                badCode:
+                  summary: Недопустимый код протокола
+                  value:
+                    code: validation_failed
+                    message: Код протокола должен состоять из строчных латинских букв, цифр и знака подчёркивания
+                    details:
+                      field: code
+                      value: Matter 1.2
+                    traceId: 2f3e4d5c6b7a89091a2b3c4d5e6f7081
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+# =====================================================================
+# Переиспользуемые части
+# =====================================================================
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |-
+        Токен пользователя, выданный внешним провайдером аутентификации
+        и проверенный API Gateway. Служба «Управление устройствами» берёт
+        из него субъекта, чтобы проверить права на дом устройства.
+    serviceAuth:
+      type: apiKey
+      in: header
+      name: X-Service-Token
+      description: |-
+        Служебный ключ для вызовов между службами внутри контура.
+        Пользовательского субъекта не несёт.
+
+  parameters:
+
+    DeviceIdQuery:
+      name: deviceId
+      in: query
+      required: true
+      description: Идентификатор устройства в реестре
+      schema:
+        type: string
+        format: uuid
+      example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |-
+        Ключ, по которому распознаётся повтор запроса. При совпадении ключа
+        в пределах суток новая команда не создаётся, а возвращается ранее
+        принятая. Защищает от двойного нажатия и от повторной отправки
+        при сетевой ошибке.
+      schema:
+        type: string
+        maxLength: 128
+      example: 3d5f8a1c-7b2e-4f60-9a13-8c4d5e6f7081
+
+    Page:
+      name: page
+      in: query
+      required: false
+      description: Номер страницы, начиная с единицы
+      schema:
+        type: integer
+        default: 1
+        minimum: 1
+
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      description: Число записей на странице
+      schema:
+        type: integer
+        default: 20
+        minimum: 1
+        maximum: 100
+
+  responses:
+
+    BadRequest:
+      description: Запрос сформирован неверно
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            malformed:
+              summary: Идентификатор не является UUID
+              value:
+                code: invalid_request
+                message: Параметр deviceId не является корректным UUID
+                details:
+                  parameter: deviceId
+                  value: '12345'
+                traceId: 0af7651916cd43dd8448eb211c80319c
+
+    Unauthorized:
+      description: Токен отсутствует, просрочен или не проходит проверку подписи
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            expired:
+              summary: Просроченный токен
+              value:
+                code: unauthorized
+                message: Срок действия токена истёк
+                traceId: 0af7651916cd43dd8448eb211c80319c
+
+    Forbidden:
+      description: |-
+        У субъекта нет прав на дом, которому принадлежит устройство.
+        Проверяется синхронным чтением службы «Дома и объекты».
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            noAccess:
+              summary: Нет доступа к дому устройства
+              value:
+                code: house_access_denied
+                message: У пользователя нет прав на дом, которому принадлежит устройство
+                details:
+                  deviceId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                  houseId: 2a7f4e10-9b3c-4d58-8e61-0f2a3b4c5d6e
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+            viewerRole:
+              summary: Роль наблюдателя не позволяет отдавать команды
+              value:
+                code: insufficient_role
+                message: Роль viewer не позволяет отправлять команды устройствам
+                details:
+                  requiredRole: resident
+                  actualRole: viewer
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    DeviceNotFound:
+      description: Устройство в реестре не зарегистрировано
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            notFound:
+              summary: Неизвестный идентификатор устройства
+              value:
+                code: device_not_found
+                message: Устройство не найдено в реестре
+                details:
+                  deviceId: 00000000-0000-0000-0000-000000000000
+                traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    UnexpectedError:
+      description: Непредвиденная ошибка на стороне службы
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            internal:
+              summary: Внутренняя ошибка
+              value:
+                code: internal_error
+                message: Внутренняя ошибка службы
+                traceId: 9b8a7c6d5e4f30211203f4e5d6c7b8a9
+            dependencyUnavailable:
+              summary: Недоступна служба, от которой зависит операция
+              value:
+                code: dependency_unavailable
+                message: Служба «Подключение устройств» не отвечает
+                details:
+                  dependency: onboarding_api
+                traceId: 9b8a7c6d5e4f30211203f4e5d6c7b8a9
+
+  schemas:
+
+    # --- общее -----------------------------------------------------
+
+    Error:
+      type: object
+      description: Единый формат ошибки для всех операций обеих служб
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: |-
+            Машиночитаемый код ошибки. Именно по нему принимает решение
+            вызывающая сторона: текст `message` предназначен человеку
+            и может измениться.
+          example: device_not_found
+        message:
+          type: string
+          description: Пояснение для человека
+          example: Устройство не найдено в реестре
+        details:
+          type: object
+          additionalProperties: true
+          description: |-
+            Подробности, зависящие от кода ошибки: имя поля, допустимый
+            диапазон, перечень поддерживаемых возможностей.
+        traceId:
+          type: string
+          description: |-
+            Сквозной идентификатор запроса. Позволяет собрать в журналах
+            путь команды через все службы — иначе разбор отказа в цепочке
+            из четырёх служб неосуществим.
+          example: 0af7651916cd43dd8448eb211c80319c
+
+    Pagination:
+      type: object
+      required:
+        - page
+        - pageSize
+        - totalPages
+        - totalResults
+      properties:
+        page:
+          type: integer
+          example: 1
+        pageSize:
+          type: integer
+          example: 20
+        totalPages:
+          type: integer
+          example: 3
+        totalResults:
+          type: integer
+          example: 45
+
+    # --- модель возможностей ---------------------------------------
+
+    DataType:
+      type: string
+      description: |-
+        Тип значения свойства или параметра команды.
+        Перечисление закрытое: расширение модели возможностей происходит
+        добавлением возможностей и свойств, а не новых типов значений.
+      enum:
+        - boolean
+        - number
+        - enumeration
+        - stream_uri
+      example: number
+
+    ValueSpec:
+      type: object
+      description: |-
+        Спецификация значения: единица измерения, границы и перечень
+        допустимых значений. Это данные реестра, а не константы в коде —
+        поэтому один и тот же код возможности у разных типов устройств
+        может иметь разные границы.
+      required:
+        - dataType
+      properties:
+        dataType:
+          $ref: '#/components/schemas/DataType'
+        unit:
+          type: string
+          description: Единица измерения; отсутствует для логических и перечислимых значений
+          example: °C
+        min:
+          type: number
+          description: Нижняя граница включительно; только для dataType = number
+          example: 5
+        max:
+          type: number
+          description: Верхняя граница включительно; только для dataType = number
+          example: 35
+        allowedValues:
+          type: array
+          description: Перечень допустимых значений; только для dataType = enumeration
+          items:
+            type: string
+          example:
+            - auto
+            - manual
+            - eco
+
+    PropertyDefinition:
+      type: object
+      description: Что возможность позволяет наблюдать
+      required:
+        - name
+        - spec
+      properties:
+        name:
+          type: string
+          description: Имя свойства, совпадающее с property_name в состоянии и телеметрии
+          example: target_temperature
+        spec:
+          $ref: '#/components/schemas/ValueSpec'
+
+    ParameterDefinition:
+      type: object
+      description: Аргумент команды
+      required:
+        - name
+        - required
+        - spec
+      properties:
+        name:
+          type: string
+          example: target_temperature
+        required:
+          type: boolean
+          example: true
+        spec:
+          $ref: '#/components/schemas/ValueSpec'
+
+    CommandDefinition:
+      type: object
+      description: Что возможность позволяет приказать
+      required:
+        - name
+        - parameters
+      properties:
+        name:
+          type: string
+          example: set_target
+        parameters:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParameterDefinition'
+
+    Capability:
+      type: object
+      description: |-
+        Возможность устройства: набор наблюдаемых свойств и доступных команд.
+        Код возможности — строка реестра, а не значение перечисления в коде
+        службы. Именно поэтому появление новой возможности не требует правки
+        этой спецификации.
+      required:
+        - code
+        - properties
+        - commands
+      properties:
+        code:
+          type: string
+          description: Код возможности
+          example: thermostat
+        name:
+          type: string
+          description: Название возможности для человека
+          example: Поддержание температуры
+        properties:
+          type: array
+          items:
+            $ref: '#/components/schemas/PropertyDefinition'
+        commands:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommandDefinition'
+
+    CapabilityProfile:
+      type: object
+      description: |-
+        Полный профиль возможностей устройства или типа устройств.
+        Ответ операции getCapabilities.
+      required:
+        - deviceTypeCode
+        - capabilities
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+          description: Присутствует, только если запрос был по конкретному устройству
+          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        deviceTypeCode:
+          type: string
+          example: boiler_v2
+        deviceTypeName:
+          type: string
+          example: Котёл «Тёплый дом» второго поколения
+        protocolCode:
+          type: string
+          description: Протокол, по которому устройство подключено к шлюзу
+          example: native_warmhouse_v1
+        executorCode:
+          $ref: '#/components/schemas/ExecutorCode'
+        capabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/Capability'
+
+    ExecutorCode:
+      type: string
+      description: |-
+        Кто исполняет команды устройства. Значение выбирается по данным
+        реестра, а не условием в коде маршрутизатора: перевод устройства
+        с унаследованного пути на шлюз — правка данных.
+      enum:
+        - gateway
+        - legacy
+      example: gateway
+
+    # --- состояние устройства --------------------------------------
+
+    Connectivity:
+      type: string
+      description: |-
+        Связь устройства с экосистемой.
+        `unknown` — устройство зарегистрировано, но ни разу не выходило
+        на связь; отличать это от `offline` необходимо при разборе обращений
+        в поддержку.
+      enum:
+        - online
+        - offline
+        - unknown
+      example: online
+
+    PropertyValue:
+      type: object
+      description: |-
+        Значение одного наблюдаемого свойства. Состояние хранится парами
+        «имя свойства → значение», а не колонкой на каждый тип прибора:
+        иначе ворота, у которых есть и положение, и питание, в модель
+        не помещаются.
+      required:
+        - capabilityCode
+        - propertyName
+        - value
+        - observedAt
+      properties:
+        capabilityCode:
+          type: string
+          example: thermostat
+        propertyName:
+          type: string
+          example: target_temperature
+        value:
+          description: Значение свойства; тип соответствует dataType из профиля возможностей
+          oneOf:
+            - type: boolean
+            - type: number
+            - type: string
+          example: 22.5
+        unit:
+          type: string
+          description: Единица измерения, продублированная из реестра для удобства клиента
+          example: °C
+        observedAt:
+          type: string
+          format: date-time
+          description: |-
+            Момент наблюдения, а не момент ответа. Расхождение с текущим
+            временем показывает, насколько состояние устарело.
+          example: '2026-09-13T18:20:09Z'
+
+    PendingCommand:
+      type: object
+      description: Команда, по которой результат ещё не получен
+      required:
+        - commandId
+        - capabilityCode
+        - commandName
+        - status
+        - createdAt
+      properties:
+        commandId:
+          type: string
+          format: uuid
+          example: 9a1c2f30-8b44-4d1e-9f2a-5c6d7e8f9012
+        capabilityCode:
+          type: string
+          example: thermostat
+        commandName:
+          type: string
+          example: set_target
+        status:
+          $ref: '#/components/schemas/CommandStatus'
+        createdAt:
+          type: string
+          format: date-time
+          example: '2026-09-13T18:20:11Z'
+
+    DeviceState:
+      type: object
+      description: |-
+        Текущее состояние устройства. Ответ операции getDeviceStatus.
+
+        Обратите внимание: состояние жизненного цикла устройства
+        (зарегистрировано, заблокировано, снято с учёта) здесь отсутствует —
+        оно принадлежит реестру, а не этой службе. Разведение трёх разных
+        «состояний» — главное отличие целевой модели от действующей.
+      required:
+        - deviceId
+        - connectivity
+        - updatedAt
+        - properties
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        deviceTypeCode:
+          type: string
+          example: boiler_v2
+        houseId:
+          type: string
+          format: uuid
+          example: 2a7f4e10-9b3c-4d58-8e61-0f2a3b4c5d6e
+        roomId:
+          type: string
+          format: uuid
+          example: 6d5c4b3a-2918-4e07-b6a5-948372615043
+        connectivity:
+          $ref: '#/components/schemas/Connectivity'
+        lastSeenAt:
+          type: string
+          format: date-time
+          description: Последнее сообщение от устройства; отсутствует при connectivity = unknown
+          example: '2026-09-13T18:20:09Z'
+        updatedAt:
+          type: string
+          format: date-time
+          example: '2026-09-13T18:20:09Z'
+        properties:
+          type: array
+          items:
+            $ref: '#/components/schemas/PropertyValue'
+        pendingCommands:
+          type: array
+          description: |-
+            Незавершённые команды. Пустой массив означает, что все отданные
+            команды завершились — успешно или отказом.
+          items:
+            $ref: '#/components/schemas/PendingCommand'
+
+    # --- команды ---------------------------------------------------
+
+    CommandStatus:
+      type: string
+      description: |-
+        Состояние команды. Промежуточное `sent` обязательно: без него
+        повторное нажатие кнопки неотличимо от первого.
+      enum:
+        - sent
+        - completed
+        - failed
+      example: sent
+
+    DeviceCommandRequest:
+      type: object
+      description: |-
+        Команда в модели возможностей. Контракт одинаков для команд
+        от пользователя через API Gateway и от службы сценариев.
+      required:
+        - deviceId
+        - capabilityCode
+        - commandName
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+          description: Адресат команды
+          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        capabilityCode:
+          type: string
+          description: |-
+            Код возможности из профиля устройства. Проверяется по реестру:
+            если тип устройства такой возможностью не обладает — 422.
+          example: thermostat
+        commandName:
+          type: string
+          description: Имя команды внутри возможности
+          example: set_target
+        arguments:
+          type: object
+          additionalProperties: true
+          description: |-
+            Аргументы команды: «имя параметра → значение». Набор и допустимые
+            значения задаются реестром, а не этой спецификацией — здесь
+            намеренно открытый объект.
+          example:
+            target_temperature: 22.5
+        issuedByScenarioId:
+          type: string
+          format: uuid
+          description: |-
+            Заполняется службой «Сценарии автоматизации», если команда является
+            действием сработавшего сценария. Позволяет отличить в журнале
+            команду человека от команды правила.
+          example: c8f0e2d1-4a5b-4c6d-9e7f-081a2b3c4d5e
+        callbackUrl:
+          type: string
+          format: uri
+          description: |-
+            Адрес, на который будет отправлен результат исполнения.
+            Необязателен: без него результат доступен опросом getDeviceStatus
+            и приходит подписчикам событием шины.
+          example: https://api.warmhouse.example/internal/hooks/command-result
+
+    CommandAccepted:
+      type: object
+      description: |-
+        Подтверждение приёма команды. Не является подтверждением исполнения:
+        устройство в этот момент команду ещё не получило.
+      required:
+        - commandId
+        - deviceId
+        - status
+        - acceptedAt
+      properties:
+        commandId:
+          type: string
+          format: uuid
+          description: |-
+            Идентификатор команды в журнале. По нему приходит результат
+            и по нему получатель распознаёт повторную доставку.
+          example: 9a1c2f30-8b44-4d1e-9f2a-5c6d7e8f9012
+        deviceId:
+          type: string
+          format: uuid
+          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        status:
+          $ref: '#/components/schemas/CommandStatus'
+        executorCode:
+          $ref: '#/components/schemas/ExecutorCode'
+        acceptedAt:
+          type: string
+          format: date-time
+          example: '2026-09-13T18:20:11Z'
+        statusUrl:
+          type: string
+          format: uri
+          description: Адрес для опроса состояния, если обратный адрес не задан
+          example: https://api.warmhouse.example/internal/device_management/getDeviceStatus?deviceId=7c9e6679-7425-40de-944b-e07fc1f90ae7
+
+    DeviceCommandCompleted:
+      type: object
+      description: |-
+        Команда исполнена устройством. Содержимое события
+        `DeviceCommandCompleted`, доставляемое на обратный адрес.
+      required:
+        - commandId
+        - deviceId
+        - status
+        - completedAt
+      properties:
+        commandId:
+          type: string
+          format: uuid
+          example: 9a1c2f30-8b44-4d1e-9f2a-5c6d7e8f9012
+        deviceId:
+          type: string
+          format: uuid
+          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        status:
+          type: string
+          enum:
+            - completed
+        completedAt:
+          type: string
+          format: date-time
+          example: '2026-09-13T18:20:13Z'
+        observedProperties:
+          type: array
+          description: |-
+            Свойства, изменившиеся в результате команды. Передаются вместе
+            с результатом, чтобы вызывающей стороне не потребовалось
+            дополнительное чтение состояния.
+          items:
+            $ref: '#/components/schemas/PropertyValue'
+
+    DeviceCommandFailed:
+      type: object
+      description: |-
+        Команда не исполнена. Содержимое события `DeviceCommandFailed`.
+        Этот путь — единственный способ сообщить об отказе, возникшем после
+        ответа 202.
+      required:
+        - commandId
+        - deviceId
+        - status
+        - failedAt
+        - errorCode
+      properties:
+        commandId:
+          type: string
+          format: uuid
+          example: 9a1c2f30-8b44-4d1e-9f2a-5c6d7e8f9012
+        deviceId:
+          type: string
+          format: uuid
+          example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        status:
+          type: string
+          enum:
+            - failed
+        failedAt:
+          type: string
+          format: date-time
+          example: '2026-09-13T18:20:41Z'
+        errorCode:
+          type: string
+          description: Машиночитаемая причина отказа
+          enum:
+            - device_timeout
+            - device_rejected
+            - device_offline
+            - executor_unavailable
+            - protocol_error
+          example: device_timeout
+        error:
+          type: string
+          description: Пояснение для человека
+          example: Устройство не подтвердило исполнение за 30 с
+
+    # --- реестр протоколов и типов ---------------------------------
+
+    DeviceType:
+      type: object
+      description: |-
+        Строка реестра типов. Добавление типа — вставка записи, а не
+        изменение кода: перечня типов нет ни в одной службе.
+      required:
+        - code
+        - name
+        - protocolCode
+        - isActive
+        - capabilityCodes
+      properties:
+        code:
+          type: string
+          example: partner_lamp_v3
+        name:
+          type: string
+          example: Умная лампа партнёра
+        manufacturer:
+          type: string
+          example: Partner Devices
+        protocolCode:
+          type: string
+          example: zigbee_3_0
+        isActive:
+          type: boolean
+          description: Снятые с продажи типы остаются в реестре ради уже установленных устройств
+          example: true
+        capabilityCodes:
+          type: array
+          description: |-
+            Только коды возможностей. Полный профиль со спецификациями
+            значений отдаётся операцией getCapabilities — здесь он был бы
+            избыточен для подбора комплекта.
+          items:
+            type: string
+          example:
+            - switchable
+            - dimmable
+
+    DeviceTypeList:
+      type: object
+      required:
+        - protocolCode
+        - items
+        - pagination
+      properties:
+        protocolCode:
+          type: string
+          description: Протокол, по которому выполнялся отбор
+          example: zigbee_3_0
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceType'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    ProtocolTransport:
+      type: string
+      description: Транспорт, поверх которого работает протокол
+      enum:
+        - mqtt
+        - tcp
+        - http
+      example: mqtt
+
+    ProtocolCreate:
+      type: object
+      description: Описание регистрируемого протокола
+      required:
+        - code
+        - name
+        - transport
+        - adapterCode
+      properties:
+        code:
+          type: string
+          description: Уникальный код протокола
+          pattern: '^[a-z0-9_]+$'
+          maxLength: 64
+          example: matter_1_2
+        name:
+          type: string
+          description: Название протокола для человека
+          example: Matter 1.2
+        transport:
+          $ref: '#/components/schemas/ProtocolTransport'
+        adapterCode:
+          type: string
+          description: |-
+            Код протокольного адаптера — развёрнутой реализации, которая умеет
+            кодировать команду и разбирать сообщение этого протокола.
+          example: matter-adapter
+        description:
+          type: string
+          example: Стандартный отраслевой протокол умного дома
+
+    Protocol:
+      type: object
+      description: Зарегистрированный протокол
+      required:
+        - code
+        - name
+        - transport
+        - adapterCode
+        - adapterStatus
+        - registeredAt
+      properties:
+        code:
+          type: string
+          example: matter_1_2
+        name:
+          type: string
+          example: Matter 1.2
+        transport:
+          $ref: '#/components/schemas/ProtocolTransport'
+        adapterCode:
+          type: string
+          example: matter-adapter
+        adapterStatus:
+          type: string
+          description: |-
+            Развёрнут ли адаптер. `missing` означает, что запись создана,
+            но устройства этого протокола шлюз обслуживать пока не может:
+            адаптер — это код, и регистрация записи его не заменяет.
+          enum:
+            - available
+            - missing
+          example: available
+        description:
+          type: string
+          example: Стандартный отраслевой протокол умного дома
+        registeredAt:
+          type: string
+          format: date-time
+          example: '2026-09-13T18:30:00Z'

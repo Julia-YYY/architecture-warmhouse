@@ -1,0 +1,98 @@
+@startuml WarmHouse_Plug_New_Device
+
+' объявление RELATIVE_INCLUDE переключает на использование локальной копии C4-PlantUML
+!$RELATIVE_INCLUDE = "."
+!include ../C4-PlantUML/C4_Dynamic.puml
+
+LAYOUT_TOP_DOWN()
+SHOW_PERSON_OUTLINE()
+
+title Диаграмма динамики C4 — сценарий 1: пользователь сам подключает приобретённое устройство
+
+' =====================================================================
+' Участники сценария. Контейнеры, в сценарии незанятые, не изображены —
+' структура целиком показана на diagrams/container/WarmHouse_Container.puml
+' =====================================================================
+
+Person_Ext(home_owner, "Владелец дома", "Клиент компании")
+System_Ext(smart_devices, "Умные устройства в доме", "Датчики, реле, приводы, камеры")
+System_Ext(identity_provider, "Провайдер идентификации", "Аутентифицирует пользователей")
+System_Ext(notification_provider, "Провайдер уведомлений", "Доставка по email и push")
+
+System_Boundary(warm_house_eco, "Тёплый дом") {
+    Container(spa, "Веб-приложение", "TypeScript, SPA в браузере")
+    Container(api_gateway, "API Gateway", "C#")
+    ContainerQueue(mqtt_broker, "Брокер устройств", "MQTT")
+    ContainerQueue(event_bus, "Шина событий", "Kafka")
+
+    Container(onboarding_api, "Подключение устройств", "C#", "Core")
+    Container(houses_api, "Дома и объекты", "C#")
+    Container(device_management_api, "Управление устройствами", "C#")
+    Container(telemetry_api, "Телеметрия", "C#")
+    Container(automation_api, "Сценарии автоматизации", "C#", "Core")
+    Container(notification_api, "Уведомления", "C#")
+
+    ContainerDb(onboarding_db, "Реестр устройств", "PostgreSQL")
+    ContainerDb(houses_db, "Дома и права доступа", "PostgreSQL")
+}
+
+' =====================================================================
+' Ход сценария использования.
+' =====================================================================
+
+Rel(home_owner, spa, "Запускает подключение устройства", "HTTPS")
+Rel(spa, api_gateway, "Запрашивает регистрацию устройства", "sync, JSON/HTTPS")
+Rel(api_gateway, identity_provider, "Проверяет токен доступа", "HTTPS, OAuth 2.0 / OIDC")
+Rel(api_gateway, onboarding_api, "Передаёт запрос на регистрацию", "sync, JSON/HTTPS")
+
+Rel(onboarding_api, houses_api, "Проверяет, что дом принадлежит пользователю", "sync, JSON/HTTPS")
+Rel(houses_api, houses_db, "Читает дома и права доступа", "SQL/TCP")
+
+Rel(onboarding_api, onboarding_db, "Пишет экземпляр устройства и его возможности", "SQL/TCP")
+Rel(onboarding_api, mqtt_broker, "Регистрирует учётные данные и топики устройства", "HTTPS, API управления брокером")
+Rel(smart_devices, mqtt_broker, "Подключается с выданными учётными данными", "MQTT/TLS")
+
+Rel(onboarding_api, event_bus, "Публикует DeviceRegistered\n(тип, набор возможностей)", "async, Kafka")
+
+' Один шаг, одна публикация, четыре получателя
+Rel(event_bus, device_management_api, "Доставляет DeviceRegistered", "async, Kafka")
+RelIndex(LastIndex(), event_bus, telemetry_api, "Доставляет DeviceRegistered", "async, Kafka")
+RelIndex(LastIndex(), event_bus, automation_api, "Доставляет DeviceRegistered", "async, Kafka")
+RelIndex(LastIndex(), event_bus, notification_api, "Доставляет DeviceRegistered", "async, Kafka")
+
+Rel(device_management_api, onboarding_api, "Читает возможности устройства", "sync, JSON/HTTPS (OHS)")
+Rel(notification_api, notification_provider, "Отправляет уведомление «устройство подключено»", "HTTPS, REST")
+
+' =====================================================================
+' Пояснения
+' =====================================================================
+
+note as N_decisions
+  **Решения разработанного сценария**
+  ....
+  **Проверка владения — синхронное чтение.** Выбрано ради
+  свежести данных: регистрация устройства в чужом доме
+  неприемлема. Альтернатива — локальная проекция
+  «дом → владелец», обновляемая событиями: более доступна, но тогда
+  данные менее свежие.
+  ....
+  **Учётные данные выдаёт подключение, а не брокер.**
+  Реестр «устройство → возможности → учётные данные»
+  принадлежит одному контексту, и он же публикует его 
+  как открытую службу.
+end note
+
+note as N_scope
+  **Границы разработанного сценария**
+  ....
+  Унаследованные устройства через этот сценарий не проходят:
+  они уже зарегистрированы в монолите и попадают в новую
+  модель через слой предотвращения искажений — см.
+  WarmHouse_Telemetry.puml.
+  ....
+  Полная структура — diagrams/container/WarmHouse_Container.puml.
+end note
+
+SHOW_LEGEND()
+
+@enduml
