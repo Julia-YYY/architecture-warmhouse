@@ -1,0 +1,361 @@
+@startuml WarmHouse_Code
+
+' Уровень кода C4 — обычная диаграмма классов UML.
+' Описана только самая критичная часть: модель возможностей устройства.
+
+title Диаграмма кода C4 — модель возможностей устройства
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam packageStyle rectangle
+
+' =====================================================================
+' 1. Каталог. Задаётся данными: строки в реестре подключения устройств.
+'    Ни один класс каталога не перечисляет конкретные типы.
+' =====================================================================
+
+package "Каталог возможностей и типов — данные" <<Frame>> {
+
+    class CapabilityDefinition {
+        + Code : string
+        + Name : string
+        --
+        Возможность как таковая: switchable,
+        measurable, positionable, streamable.
+        Строка-код, а не значение перечисления C#
+    }
+
+    class PropertyDefinition {
+        + Name : string
+        + Spec : ValueSpec
+        --
+        Что возможность позволяет наблюдать:
+        power, temperature, position
+    }
+
+    class CommandDefinition {
+        + Name : string
+        --
+        Что возможность позволяет приказать:
+        turn_on, set_target, open_to
+    }
+
+    class ParameterDefinition {
+        + Name : string
+        + Spec : ValueSpec
+        + Required : bool
+    }
+
+    class ValueSpec {
+        + DataType : DataType
+        + Unit : string
+        + Min : decimal?
+        + Max : decimal?
+        + AllowedValues : IReadOnlyList<string>
+        --
+        + Accepts(value : object) : bool
+        --
+        Единицы, шкалы и диапазоны —
+        данные, а не константы в коде
+    }
+
+    enum DataType {
+        Boolean
+        Number
+        Enumeration
+        StreamUri
+    }
+
+    class DeviceType {
+        + Code : string
+        + Manufacturer : string
+        + ProtocolCode : string
+        --
+        Строка реестра. Добавление типа —
+        вставка записи, а не изменение кода
+    }
+
+    class TypeCapability {
+        + Spec : ValueSpec
+        --
+        Уточнение возможности для типа:
+        например, целевая температура 5..35 °C
+        у этого котла и 5..95 °C у другого
+    }
+}
+
+' =====================================================================
+' 2. Экземпляры и состояние
+' =====================================================================
+
+package "Экземпляры и состояние" <<Frame>> {
+
+    class Device {
+        + Id : Guid
+        + HouseId : Guid
+        + ExecutorCode : string
+        + Credentials : DeviceCredentials
+        --
+        ExecutorCode выбирает исполнителя:
+        «шлюз» или «монолит». Перевод
+        устройства на новый путь — правка данных
+    }
+
+    class DeviceState {
+        + DeviceId : Guid
+        + UpdatedAt : DateTimeOffset
+        --
+        + Apply(observation : Observation) : void
+    }
+
+    class CapabilityState {
+        + CapabilityCode : string
+    }
+
+    class PropertyValue {
+        + PropertyName : string
+        + Value : object
+        + ObservedAt : DateTimeOffset
+        --
+        Значение хранится как пара
+        «имя свойства → значение», а не
+        как колонка на каждый тип прибора
+    }
+
+    class Observation {
+        + DeviceId : Guid
+        + CapabilityCode : string
+        + PropertyName : string
+        + Value : object
+        + ObservedAt : DateTimeOffset
+        --
+        Содержимое события TelemetryReceived
+    }
+}
+
+' =====================================================================
+' 3. Команды
+' =====================================================================
+
+package "Команды" <<Frame>> {
+
+    class DeviceCommand {
+        + Id : Guid
+        + DeviceId : Guid
+        + CapabilityCode : string
+        + CommandName : string
+        + Arguments : IReadOnlyDictionary<string, object>
+        + IssuedBy : Guid
+        --
+        Адресована одному исполнителю,
+        поэтому доставляется точечно
+    }
+
+    class CommandResult {
+        + CommandId : Guid
+        + Status : CommandStatus
+        + Error : string
+        --
+        Содержимое событий
+        DeviceCommandCompleted / Failed
+    }
+
+    enum CommandStatus {
+        Sent
+        Completed
+        Failed
+    }
+}
+
+' =====================================================================
+' 4. Механизм. Код, который не меняется при появлении нового типа.
+' =====================================================================
+
+package "Механизм — код" <<Frame>> {
+
+    class CommandValidator {
+        + Validate(command : DeviceCommand, type : DeviceType) : bool
+        --
+        Сверяет команду с возможностями типа
+    }
+
+    interface ICommandExecutor {
+        + ExecutorCode : string
+        + ExecuteAsync(command : DeviceCommand) : Task
+    }
+
+    class GatewayCommandExecutor
+    class LegacyCommandExecutor
+
+    interface IProtocolAdapter {
+        + ProtocolCode : string
+        + Encode(command : DeviceCommand, type : DeviceType) : DeviceMessage
+        + Decode(message : DeviceMessage, type : DeviceType) : IReadOnlyList<Observation>
+    }
+
+    class NativeProtocolAdapter
+    class PartnerProtocolAdapter
+
+    class DeviceMessage {
+        + Topic : string
+        + Payload : byte[]
+        --
+        Сырое сообщение в протоколе устройства.
+        Дальше адаптера не проходит
+    }
+
+    class CapabilityMapper {
+        + ToObservation(raw : object, property : PropertyDefinition) : Observation
+        + ToDeviceValue(argument : object, parameter : ParameterDefinition) : object
+        --
+        Переводит смысл по ValueSpec:
+        единицы, шкалы, перечисления
+    }
+}
+
+' =====================================================================
+' 5. As-Is: модель монолита
+' =====================================================================
+
+package "As-Is — модель монолита (apps/smart_home/models/sensor.go)" <<Frame>> {
+
+    class Sensor <<Go struct>> {
+        + ID : int
+        + Name : string
+        + Type : SensorType
+        + Location : string
+        + Value : float64
+        + Unit : string
+        + Status : string
+        + LastUpdated : time.Time
+    }
+
+    class SensorType <<Go const>> {
+        Temperature = "temperature"
+    }
+}
+
+' =====================================================================
+' Связи каталога
+' =====================================================================
+
+DeviceType "1" *-- "0..*" TypeCapability : какие возможности\nу этого типа
+TypeCapability "0..*" --> "1" CapabilityDefinition
+TypeCapability "0..1" --> "1" ValueSpec : сужает диапазон
+
+CapabilityDefinition "1" *-- "0..*" PropertyDefinition : что наблюдается
+CapabilityDefinition "1" *-- "0..*" CommandDefinition : что приказывается
+CommandDefinition "1" *-- "0..*" ParameterDefinition
+
+PropertyDefinition "1" --> "1" ValueSpec
+ParameterDefinition "1" --> "1" ValueSpec
+ValueSpec --> DataType
+
+' =====================================================================
+' Связи экземпляров
+' =====================================================================
+
+Device "0..*" --> "1" DeviceType : единственная ссылка на тип во всей модели
+Device "1" -- "1" DeviceState
+DeviceState "1" *-- "0..*" CapabilityState
+CapabilityState "1" *-- "0..*" PropertyValue
+CapabilityState "0..*" ..> "1" CapabilityDefinition : по коду
+PropertyValue "0..*" ..> "1" PropertyDefinition : по имени
+Observation ..> Device
+Observation ..> PropertyDefinition : по имени
+DeviceState ..> Observation : Apply
+
+' =====================================================================
+' Связи команд и механизма
+' =====================================================================
+
+DeviceCommand "0..*" --> "1" Device
+DeviceCommand "0..*" ..> "1" CommandDefinition : по коду возможности и имени команды
+CommandResult "1" --> "1" DeviceCommand
+CommandResult --> CommandStatus
+
+CommandValidator ..> DeviceCommand
+CommandValidator ..> DeviceType
+CommandValidator ..> ValueSpec : Accepts
+
+ICommandExecutor <|.. GatewayCommandExecutor
+ICommandExecutor <|.. LegacyCommandExecutor
+ICommandExecutor ..> DeviceCommand
+Device ..> ICommandExecutor : выбирается по ExecutorCode
+
+IProtocolAdapter <|.. NativeProtocolAdapter
+IProtocolAdapter <|.. PartnerProtocolAdapter
+IProtocolAdapter ..> DeviceMessage
+IProtocolAdapter ..> Observation
+IProtocolAdapter ..> CapabilityMapper
+DeviceType ..> IProtocolAdapter : выбирается по ProtocolCode
+CapabilityMapper ..> ValueSpec
+
+' =====================================================================
+' Пояснения
+' =====================================================================
+
+note as N_validate
+  **Проверка команды — целиком, без единого упоминания типа**
+  ....
+  var cap = type.Capabilities
+      .FirstOrDefault(c => c.Capability.Code == command.CapabilityCode);
+  if (cap is null) return false;            // тип этого не умеет
+  ....
+  var def = cap.Capability.Commands
+      .FirstOrDefault(c => c.Name == command.CommandName);
+  if (def is null) return false;
+  ....
+  return def.Parameters.All(p =>
+      p.Spec.Accepts(command.Arguments.GetValueOrDefault(p.Name)));
+  ....
+  Ни switch, ни if по коду типа устройства. Появление ворот
+  или камеры этот метод не затрагивает.
+end note
+
+note as N_newtype
+  **Что нужно, чтобы добавить ворота**
+  ....
+  Строка в DeviceType: code = "gate_v1", protocol = "native".
+  ....
+  Две строки в TypeCapability: ссылки на возможности
+  "switchable" и "positionable".
+  ....
+  Если возможность "positionable" ещё не заведена —
+  строка в CapabilityDefinition, строка в PropertyDefinition
+  (position, Number, %, 0..100) и строка в CommandDefinition
+  (open_to с параметром position).
+  ....
+  Классов не добавляется, существующие не правятся.
+  Это и есть содержание сценария 6 ТЗ на уровне кода.
+end note
+
+note as N_contrast
+  **Почему модель монолита так не умеет**
+  ....
+  **Тип — закрытое перечисление в коде.** SensorType имеет
+  одно значение, добавление второго требует правки
+  исходника и пересборки. В новой модели тип — строка в реестре.
+  ....
+  **Одно значение на прибор.** Value float64 и Unit string
+  описывают одно скалярное измерение. Ворота, у которых есть
+  и положение, и состояние, в эту структуру не помещаются —
+  потребовались бы новые колонки, а с ними правка всех
+  читающих запросов. В новой модели это строки в PropertyValue.
+  ....
+  **Описание типа, экземпляр и последнее показание слиты
+  в одну строку.** В новой модели они разделены на DeviceType,
+  Device и PropertyValue, поэтому справочник возможностей
+  общий, а не копируется в каждую запись прибора.
+  ....
+  Перевод из этой структуры в модель возможностей выполняет
+  слой предотвращения искажений — единственный код,
+  которому Sensor известен.
+end note
+
+N_validate .. CommandValidator
+N_newtype .. DeviceType
+N_limit .. IProtocolAdapter
+N_contrast .. Sensor
+
+@enduml

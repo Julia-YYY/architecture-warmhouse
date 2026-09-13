@@ -1,10 +1,9 @@
-!$RELATIVE_INCLUDE = "."
 ' convert it with additional command line argument -DRELATIVE_INCLUDE="relative/absolute" to use locally
-'!if %variable_exists("RELATIVE_INCLUDE")
+!if %variable_exists("RELATIVE_INCLUDE")
   !include ./C4.puml
-' !else
-'  !include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4.puml
-'!endif
+!else
+  !include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4.puml
+!endif
 
 ' Scope: A single software system.
 ' Primary elements: The software system in scope.

@@ -1,0 +1,262 @@
+@startuml ER_Diagram_Phase2
+
+' Задание 3 — логическая модель данных, хранилища фазы 2.
+' Вынесены из ER_Diagram_General.puml
+
+title ER-диаграмма — комплекты, заказы, подписки и платежи (фаза 2)
+
+hide circle
+skinparam roundcorner 0
+skinparam shadowing false
+skinparam packageStyle rectangle
+
+' =====================================================================
+' Чужие хранилища. Показаны сокращённо — только то, на что ссылаемся.
+' Полное описание — в ER_Diagram_General.puml.
+' =====================================================================
+
+package "Чужие хранилища — показаны сокращённо" <<Rectangle>> {
+
+    entity "users" as users {
+        * id : uuid <<PK>>
+        --
+        houses_db
+    }
+
+    entity "houses" as houses {
+        * id : uuid <<PK>>
+        --
+        houses_db
+    }
+
+    entity "device_types" as device_types {
+        * id : uuid <<PK>>
+        * code : text <<UQ>>
+        --
+        onboarding_db
+    }
+
+    entity "devices" as devices {
+        * id : uuid <<PK>>
+        --
+        onboarding_db
+    }
+}
+
+' =====================================================================
+' Каталог и продажи. «Модульные комплекты» из ТЗ.
+' =====================================================================
+
+package "catalog_db — Каталог и заказы (PostgreSQL)" <<Database>> {
+
+    entity "product_kits" as kits {
+        * id : uuid <<PK>>
+        --
+        * code : text <<UQ>>
+        * name : text
+        description : text
+        * price : numeric(12,2)
+        * currency : char(3)
+        * is_available : boolean
+        ..
+        «Модуль» из ТЗ: готовый к подключению
+        комплект приборов
+    }
+
+    entity "kit_items" as kit_items {
+        * id : uuid <<PK>>
+        --
+        * kit_id : uuid <<FK product_kits>>
+        * device_type_code : text <<логическая ссылка>>
+        * quantity : int
+        ..
+        Ссылка на тип по коду, а не по uuid:
+        каталог не обязан знать
+        идентификаторы чужого реестра
+    }
+
+    entity "orders" as orders {
+        * id : uuid <<PK>>
+        --
+        * user_id : uuid <<логическая ссылка>>
+        house_id : uuid <<логическая ссылка>>
+        * status : text <<created/paid/shipped/cancelled>>
+        * total_amount : numeric(12,2)
+        * currency : char(3)
+        * created_at : timestamptz
+    }
+
+    entity "order_items" as order_items {
+        * id : uuid <<PK>>
+        --
+        * order_id : uuid <<FK orders>>
+        * kit_id : uuid <<FK product_kits>>
+        * quantity : int
+        * unit_price : numeric(12,2)
+        ..
+        Цена копируется в позицию заказа.
+        Изменение прайса не должно
+        переписывать историю продаж
+    }
+
+    entity "order_units" as order_units {
+        * id : uuid <<PK>>
+        --
+        * order_item_id : uuid <<FK order_items>>
+        * device_type_code : text <<логическая ссылка>>
+        * serial_number : text <<UQ>>
+        device_id : uuid <<логическая ссылка>>
+        ..
+        Отгруженные экземпляры приборов.
+        Замыкает путь «оплачен комплект →
+        устройства, готовые к подключению»
+    }
+}
+
+' =====================================================================
+' Биллинг и подписки. Тонкий слой перевода к платёжному провайдеру.
+' =====================================================================
+
+package "billing_db — Подписки и платежи (PostgreSQL)" <<Database>> {
+
+    entity "subscription_plans" as plans {
+        * code : text <<PK>>
+        --
+        * name : text
+        * price : numeric(12,2)
+        * currency : char(3)
+        * period : text <<month/year>>
+        * is_active : boolean
+    }
+
+    entity "subscriptions" as subscriptions {
+        * id : uuid <<PK>>
+        --
+        * user_id : uuid <<логическая ссылка>>
+        * plan_code : text <<FK subscription_plans>>
+        * status : text <<active/past_due/cancelled>>
+        * started_at : timestamptz
+        ends_at : timestamptz
+    }
+
+    entity "payments" as payments {
+        * id : uuid <<PK>>
+        --
+        order_id : uuid <<логическая ссылка>>
+        subscription_id : uuid <<FK subscriptions>>
+        * provider_payment_id : text <<UQ>>
+        * amount : numeric(12,2)
+        * currency : char(3)
+        * status : text <<pending/succeeded/failed>>
+        * created_at : timestamptz
+        ..
+        Собственные понятия платежа.
+        provider_payment_id — единственный
+        след чужой модели во всей экосистеме
+    }
+
+    entity "payment_events" as payment_events {
+        * id : bigint <<PK>>
+        --
+        * payment_id : uuid <<FK payments>>
+        * provider_event_id : text <<UQ>>
+        * raw_payload : jsonb
+        * received_at : timestamptz
+        processed_at : timestamptz
+        ..
+        Журнал ответов и уведомлений провайдера.
+        UNIQUE по его идентификатору даёт
+        защиту от повторной обработки
+    }
+
+    entity "outbox_messages" as outbox {
+        * id : bigint <<PK>>
+        --
+        * aggregate_id : uuid
+        * event_type : text <<PaymentCompleted/SubscriptionActivated>>
+        * payload : jsonb
+        * created_at : timestamptz
+        published_at : timestamptz
+    }
+}
+
+' =====================================================================
+' Связи внутри одного хранилища — настоящие внешние ключи
+' =====================================================================
+
+kits ||--o{ kit_items : состав комплекта
+kits ||--o{ order_items : заказывается
+orders ||--o{ order_items : позиции заказа
+order_items ||--o{ order_units : отгруженные экземпляры
+
+plans ||--o{ subscriptions : тариф подписки
+subscriptions ||--o{ payments : оплаты подписки
+payments ||--o{ payment_events : ответы провайдера
+
+' =====================================================================
+' Связи между хранилищами — логические, внешнего ключа нет
+' =====================================================================
+
+users ||..o{ orders : оформляет
+houses ||..o{ orders : для какого дома
+users ||..o{ subscriptions : подписан
+orders ||..o{ payments : оплачивается
+device_types ||..o{ kit_items : состав комплекта
+device_types ||..o{ order_units : тип отгруженного прибора
+order_units }o..|| devices : после подключения\nстановится устройством
+
+' =====================================================================
+' Пояснения
+' =====================================================================
+
+note as N_scope
+  **Почему эти хранилища отдельно**
+  ....
+  По диаграмме контейнеров каталог и биллинг отнесены к фазе 2:
+  бизнес-цель ТЗ называет MVP как микросервисы управления
+  отоплением, освещением, наблюдением и воротами и продажу
+  комплектов не упоминает. Команда из пяти человек —
+  четыре-шесть служб в эксплуатации.
+  ....
+  Обозначения и обоснование разбиения по хранилищам —
+  в ER_Diagram_General.puml.
+end note
+
+note as N_acl
+  **Модель провайдера сюда не проникает**
+  ....
+  Биллинг — тонкий слой перевода: собственные понятия подписки
+  и платежа, а от провайдера сохраняются только его
+  идентификаторы. Смена провайдера затрагивает
+  provider_payment_id, payment_events.raw_payload и код клиента,
+  но не заказы, подписки и не остальную экосистему.
+  ....
+  **payment_events** нужен потому, что уведомление о платеже
+  приходит повторно: провайдер не гарантирует единственной
+  доставки. UNIQUE по provider_event_id делает обработку
+  идемпотентной — без него одна оплата может быть зачтена дважды.
+  ....
+  Направление уведомления от провайдера (обратный вызов
+  или опрос) на диаграмме контейнеров оставлено открытым
+  вопросом; на модель данных выбор не влияет.
+end note
+
+note as N_link
+  **Как заказ превращается в подключаемые устройства**
+  ....
+  Оплаченный заказ → order_units с серийными номерами →
+  событие в шину → «Подключение устройств» заводит записи,
+  готовые к регистрации. Пользователь при подключении
+  вводит серийный номер, а не описывает прибор с нуля.
+  ....
+  Поле order_units.device_id заполняется после регистрации
+  и существует ради прослеживаемости «продано → подключено».
+  Обратной ссылки из devices на заказ нет намеренно: реестр
+  устройств не должен зависеть от контекста продаж.
+  ....
+  Ссылки на тип идут по code, а не по uuid: каталог и реестр
+  договариваются об опубликованном языке, а не об
+  идентификаторах чужих строк.
+end note
+
+@enduml
